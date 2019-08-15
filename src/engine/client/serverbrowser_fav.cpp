@@ -78,7 +78,7 @@ bool CServerBrowserFavorites::AddFavoriteEx(const char *pHostname, const NETADDR
 	if(g_Config.m_Debug)
 	{
 		char aBuf[256];
-		str_format(aBuf, sizeof(aBuf), "added fav '%s' (%s)", pHostname);
+		str_format(aBuf, sizeof(aBuf), "added fav '%s'", pHostname);
 		m_pConsole->Print(IConsole::OUTPUT_LEVEL_DEBUG, "client_srvbrowse", aBuf);
 	}
 
@@ -139,7 +139,7 @@ bool CServerBrowserFavorites::RemoveFavoriteEx(const char *pHostname, const NETA
 		}
 		else if(pFavEntry->m_State <= FAVSTATE_LOOKUPCHECK && m_FavLookup.m_FavoriteIndex == Index)
 		{
-			// skip result on favorite hostname lookup 
+			// skip result on favorite hostname lookup
 			m_FavLookup.m_FavoriteIndex = -1;
 		}
 		

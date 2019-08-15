@@ -3,6 +3,8 @@
 #ifndef ENGINE_CLIENT_CLIENT_H
 #define ENGINE_CLIENT_CLIENT_H
 
+#include <base/hash.h>
+
 class CGraph
 {
 public:
@@ -84,8 +86,10 @@ class CClient : public IClient, public CDemoPlayer::IListner
 	int64 m_LocalStartTime;
 
 	IGraphics::CTextureHandle m_DebugFont;
-	
+
 	int64 m_LastRenderTime;
+	int64 m_LastCpuTime;
+	float m_LastAvgCpuFrameTime;
 	float m_RenderFrameTimeLow;
 	float m_RenderFrameTimeHigh;
 	int m_RenderFrames;
@@ -94,6 +98,7 @@ class CClient : public IClient, public CDemoPlayer::IListner
 	int m_WindowMustRefocus;
 	int m_SnapCrcErrors;
 	bool m_AutoScreenshotRecycle;
+	bool m_AutoStatScreenshotRecycle;
 	bool m_EditorActive;
 	bool m_SoundInitFailed;
 	bool m_ResortServerBrowser;
@@ -112,6 +117,8 @@ class CClient : public IClient, public CDemoPlayer::IListner
 
 	//
 	char m_aCurrentMap[256];
+	char m_aCurrentMapPath[256];
+	SHA256_DIGEST m_CurrentMapSha256;
 	unsigned m_CurrentMapCrc;
 
 	//
@@ -124,6 +131,8 @@ class CClient : public IClient, public CDemoPlayer::IListner
 	int m_MapdownloadChunk;
 	int m_MapdownloadChunkNum;
 	int m_MapDownloadChunkSize;
+	SHA256_DIGEST m_MapdownloadSha256;
+	bool m_MapdownloadSha256Present;
 	int m_MapdownloadCrc;
 	int m_MapdownloadAmount;
 	int m_MapdownloadTotalsize;
@@ -172,6 +181,7 @@ class CClient : public IClient, public CDemoPlayer::IListner
 			STATE_INIT=0,
 			STATE_START,
 			STATE_READY,
+			STATE_ERROR,
 		};
 
 		int m_State;
@@ -209,7 +219,6 @@ public:
 
 	virtual IGraphics::CTextureHandle GetDebugFont() const { return m_DebugFont; }
 
-	void DirectInput(int *pInput, int Size);
 	void SendInput();
 
 	// TODO: OPT: do this alot smarter!
@@ -250,15 +259,14 @@ public:
 
 	virtual const char *ErrorString() const;
 
-	const char *LoadMap(const char *pName, const char *pFilename, unsigned WantedCrc);
-	const char *LoadMapSearch(const char *pMapName, int WantedCrc);
-
-	static int PlayerScoreComp(const void *a, const void *b);
+	const char *LoadMap(const char *pName, const char *pFilename, const SHA256_DIGEST *pWantedSha256, unsigned WantedCrc);
+	const char *LoadMapSearch(const char *pMapName, const SHA256_DIGEST *pWantedSha256, int WantedCrc);
 
 	int UnpackServerInfo(CUnpacker *pUnpacker, CServerInfo *pInfo, int *pToken);
 	void ProcessConnlessPacket(CNetChunk *pPacket);
 	void ProcessServerPacket(CNetChunk *pPacket);
 
+	const char *GetCurrentMapPath() const { return m_aCurrentMapPath; }
 	virtual const char *MapDownloadName() const { return m_aMapdownloadName; }
 	virtual int MapDownloadAmount() const { return m_MapdownloadAmount; }
 	virtual int MapDownloadTotalsize() const { return m_MapdownloadTotalsize; }
@@ -273,8 +281,10 @@ public:
 	void RegisterInterfaces();
 	void InitInterfaces();
 
+	bool LimitFps();
 	void Run();
 
+	void ConnectOnStart(const char *pAddress);
 
 	static void Con_Connect(IConsole::IResult *pResult, void *pUserData);
 	static void Con_Disconnect(IConsole::IResult *pResult, void *pUserData);
@@ -306,6 +316,7 @@ public:
 	void RecordGameMessage(bool State) { m_RecordGameMessage = State; }
 
 	void AutoScreenshot_Start();
+	void AutoStatScreenshot_Start();
 	void AutoScreenshot_Cleanup();
 
 	void ServerBrowserUpdate();
@@ -315,9 +326,5 @@ public:
 	void ToggleFullscreen();
 	void ToggleWindowBordered();
 	void ToggleWindowVSync();
-
-	// Teeworlds connect link
-	const char * const m_pConLinkIdentifier;
-	void HandleTeeworldsConnectLink(const char *pConLink);
 };
 #endif

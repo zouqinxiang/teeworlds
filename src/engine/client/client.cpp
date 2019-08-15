@@ -1,8 +1,8 @@
 /* (c) Magnus Auvinen. See licence.txt in the root of the distribution for more information. */
 /* If you are missing that file, acquire a complete release at teeworlds.com.                */
 #include <new>
+#include <algorithm>
 
-#include <stdlib.h> // qsort
 #include <stdarg.h>
 
 #include <base/math.h>
@@ -239,7 +239,7 @@ void CSmoothTime::Update(CGraph *pGraph, int64 Target, int TimeLeft, int AdjustD
 		UpdateInt(Target);
 }
 
-CClient::CClient() : m_DemoPlayer(&m_SnapshotDelta), m_DemoRecorder(&m_SnapshotDelta), m_pConLinkIdentifier("teeworlds:")
+CClient::CClient() : m_DemoPlayer(&m_SnapshotDelta), m_DemoRecorder(&m_SnapshotDelta)
 {
 	m_pEditor = 0;
 	m_pInput = 0;
@@ -254,12 +254,15 @@ CClient::CClient() : m_DemoPlayer(&m_SnapshotDelta), m_DemoRecorder(&m_SnapshotD
 	m_RenderFrameTimeHigh = 0.0f;
 	m_RenderFrames = 0;
 	m_LastRenderTime = time_get();
+	m_LastCpuTime = time_get();
+	m_LastAvgCpuFrameTime = 0;
 
 	m_GameTickSpeed = SERVER_TICK_SPEED;
 
 	m_WindowMustRefocus = 0;
 	m_SnapCrcErrors = 0;
 	m_AutoScreenshotRecycle = false;
+	m_AutoStatScreenshotRecycle = false;
 	m_EditorActive = false;
 
 	m_AckGameTick = -1;
@@ -275,6 +278,7 @@ CClient::CClient() : m_DemoPlayer(&m_SnapshotDelta), m_DemoRecorder(&m_SnapshotD
 
 	//
 	m_aCurrentMap[0] = 0;
+	m_CurrentMapSha256 = SHA256_ZEROED;
 	m_CurrentMapCrc = 0;
 
 	//
@@ -285,6 +289,8 @@ CClient::CClient() : m_DemoPlayer(&m_SnapshotDelta), m_DemoRecorder(&m_SnapshotD
 	m_aMapdownloadName[0] = 0;
 	m_MapdownloadFile = 0;
 	m_MapdownloadChunk = 0;
+	m_MapdownloadSha256 = SHA256_ZEROED;
+	m_MapdownloadSha256Present = false;
 	m_MapdownloadCrc = 0;
 	m_MapdownloadAmount = -1;
 	m_MapdownloadTotalsize = -1;
@@ -335,6 +341,7 @@ void CClient::SendInfo()
 	CMsgPacker Msg(NETMSG_INFO, true);
 	Msg.AddString(GameClient()->NetVersion(), 128);
 	Msg.AddString(g_Config.m_Password, 128);
+	Msg.AddInt(GameClient()->ClientVersion());
 	SendMsg(&Msg, MSGFLAG_VITAL|MSGFLAG_FLUSH);
 }
 
@@ -373,20 +380,6 @@ bool CClient::ConnectionProblems() const
 	return m_NetClient.GotProblems() != 0;
 }
 
-void CClient::DirectInput(int *pInput, int Size)
-{
-	CMsgPacker Msg(NETMSG_INPUT, true);
-	Msg.AddInt(m_AckGameTick);
-	Msg.AddInt(m_PredTick);
-	Msg.AddInt(Size);
-
-	for(int i = 0; i < Size/4; i++)
-		Msg.AddInt(pInput[i]);
-
-	SendMsg(&Msg, 0);
-}
-
-
 void CClient::SendInput()
 {
 	int64 Now = time_get();
@@ -413,6 +406,12 @@ void CClient::SendInput()
 	// pack it
 	for(int i = 0; i < Size/4; i++)
 		Msg.AddInt(m_aInputs[m_CurrentInput].m_aData[i]);
+
+	int PingCorrection = 0;
+	int64 TagTime;
+	if(m_SnapshotStorage.Get(m_AckGameTick, &TagTime, 0, 0) >= 0)
+		PingCorrection = (int)(((Now-TagTime)*1000)/time_freq());
+	Msg.AddInt(PingCorrection);
 
 	m_CurrentInput++;
 	m_CurrentInput%=200;
@@ -514,6 +513,7 @@ void CClient::Connect(const char *pAddress)
 	}
 
 	m_RconAuthed = 0;
+	m_UseTempRconCommands = 0;
 	if(m_ServerAddress.port == 0)
 		m_ServerAddress.port = Port;
 	m_NetClient.Connect(&m_ServerAddress);
@@ -549,6 +549,8 @@ void CClient::DisconnectWithReason(const char *pReason)
 	if(m_MapdownloadFile)
 		io_close(m_MapdownloadFile);
 	m_MapdownloadFile = 0;
+	m_MapdownloadSha256 = SHA256_ZEROED;
+	m_MapdownloadSha256Present = false;
 	m_MapdownloadCrc = 0;
 	m_MapdownloadTotalsize = -1;
 	m_MapdownloadAmount = 0;
@@ -604,24 +606,38 @@ void CClient::SnapInvalidateItem(int SnapID, int Index)
 			m_pConsole->Print(IConsole::OUTPUT_LEVEL_DEBUG, "client", "snap invalidate problem");
 		if((char *)i >= (char *)m_aSnapshots[SnapID]->m_pSnap && (char *)i < (char *)m_aSnapshots[SnapID]->m_pSnap + m_aSnapshots[SnapID]->m_SnapSize)
 			m_pConsole->Print(IConsole::OUTPUT_LEVEL_DEBUG, "client", "snap invalidate problem");
-		i->m_TypeAndID = -1;
+		m_aSnapshots[SnapID]->m_pAltSnap->InvalidateItem(Index);
 	}
+}
+
+static const int* SnapSearchKey(const int* pKeysStart, const int* pKeysEnd, int Key)
+{
+	int MiddleIndex = (pKeysEnd - pKeysStart) / 2;
+	int Middle = pKeysStart[MiddleIndex];
+	if(MiddleIndex == 0)
+		return Middle == Key ? pKeysStart : 0x0;
+	if(Middle > Key)
+		return SnapSearchKey(pKeysStart, pKeysStart+MiddleIndex, Key);
+	if(Middle < Key)
+		return SnapSearchKey(pKeysStart+MiddleIndex, pKeysEnd, Key);
+	// ==
+	return pKeysStart + MiddleIndex;
 }
 
 const void *CClient::SnapFindItem(int SnapID, int Type, int ID) const
 {
-	// TODO: linear search. should be fixed.
-	int i;
-
 	if(!m_aSnapshots[SnapID])
 		return 0x0;
 
-	for(i = 0; i < m_aSnapshots[SnapID]->m_pSnap->NumItems(); i++)
-	{
-		CSnapshotItem *pItem = m_aSnapshots[SnapID]->m_pAltSnap->GetItem(i);
-		if(pItem->Type() == Type && pItem->ID() == ID)
-			return (void *)pItem->Data();
-	}
+	const int NumItems = m_aSnapshots[SnapID]->m_pSnap->NumItems();
+	CSnapshot* pAltSnap = m_aSnapshots[SnapID]->m_pAltSnap;
+	const int* pItemKeys = pAltSnap->GetItemKeys();
+
+	int Key = (Type<<16)|(ID&0xffff);
+	int Index = SnapSearchKey(pItemKeys, pItemKeys+NumItems, Key) - pItemKeys;
+	if(Index >= 0 && Index < NumItems)
+		return (void *)pAltSnap->GetItem(Index)->Data();
+
 	return 0x0;
 }
 
@@ -676,10 +692,8 @@ void CClient::DebugRender()
 		total = 42
 	*/
 	FrameTimeAvg = FrameTimeAvg*0.9f + m_RenderFrameTime*0.1f;
-	str_format(aBuffer, sizeof(aBuffer), "ticks: %8d %8d mem %dk %d gfxmem: %dk fps: %3d",
+	str_format(aBuffer, sizeof(aBuffer), "ticks: %8d %8d gfxmem: %dk fps: %3d",
 		m_CurGameTick, m_PredTick,
-		mem_stats()->allocated/1024,
-		mem_stats()->total_allocations,
 		Graphics()->MemoryUsage()/1024,
 		(int)(1.0f/FrameTimeAvg + 0.5f));
 	Graphics()->QuadsText(2, 2, 16, aBuffer);
@@ -762,15 +776,27 @@ void CClient::Render()
 	DebugRender();
 }
 
-const char *CClient::LoadMap(const char *pName, const char *pFilename, unsigned WantedCrc)
+const char *CClient::LoadMap(const char *pName, const char *pFilename, const SHA256_DIGEST *pWantedSha256, unsigned WantedCrc)
 {
-	static char aErrorMsg[128];
+	static char aErrorMsg[512];
 
 	SetState(IClient::STATE_LOADING);
 
 	if(!m_pMap->Load(pFilename))
 	{
 		str_format(aErrorMsg, sizeof(aErrorMsg), "map '%s' not found", pFilename);
+		return aErrorMsg;
+	}
+
+	if(pWantedSha256 && m_pMap->Sha256() != *pWantedSha256)
+	{
+		char aSha256[SHA256_MAXSTRSIZE];
+		char aWantedSha256[SHA256_MAXSTRSIZE];
+		sha256_str(m_pMap->Sha256(), aSha256, sizeof(aSha256));
+		sha256_str(*pWantedSha256, aWantedSha256, sizeof(aWantedSha256));
+		str_format(aErrorMsg, sizeof(aErrorMsg), "map differs from the server. %s != %s", aSha256, aWantedSha256);
+		m_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, "client", aErrorMsg);
+		m_pMap->Unload();
 		return aErrorMsg;
 	}
 
@@ -792,55 +818,73 @@ const char *CClient::LoadMap(const char *pName, const char *pFilename, unsigned 
 	m_RecivedSnapshots = 0;
 
 	str_copy(m_aCurrentMap, pName, sizeof(m_aCurrentMap));
+	str_copy(m_aCurrentMapPath, pFilename, sizeof(m_aCurrentMapPath));
+	m_CurrentMapSha256 = m_pMap->Sha256();
 	m_CurrentMapCrc = m_pMap->Crc();
 
 	return 0x0;
 }
 
 
+static void FormatMapDownloadFilename(const char *pName, const SHA256_DIGEST *pSha256, int Crc, char *pBuffer, int BufferSize)
+{
+	if(pSha256)
+	{
+		char aSha256[SHA256_MAXSTRSIZE];
+		sha256_str(*pSha256, aSha256, sizeof(aSha256));
+		str_format(pBuffer, BufferSize, "downloadedmaps/%s_%s.map", pName, aSha256);
+	}
+	else
+	{
+		str_format(pBuffer, BufferSize, "downloadedmaps/%s_%08x.map", pName, Crc);
+	}
+}
 
-const char *CClient::LoadMapSearch(const char *pMapName, int WantedCrc)
+
+const char *CClient::LoadMapSearch(const char *pMapName, const SHA256_DIGEST *pWantedSha256, int WantedCrc)
 {
 	const char *pError = 0;
 	char aBuf[512];
-	str_format(aBuf, sizeof(aBuf), "loading map, map=%s wanted crc=%08x", pMapName, WantedCrc);
+	char aWanted[SHA256_MAXSTRSIZE + 16];
+	aWanted[0] = 0;
+	if(pWantedSha256)
+	{
+		char aWantedSha256[SHA256_MAXSTRSIZE];
+		sha256_str(*pWantedSha256, aWantedSha256, sizeof(aWantedSha256));
+		str_format(aWanted, sizeof(aWanted), "sha256=%s ", aWantedSha256);
+	}
+	str_format(aBuf, sizeof(aBuf), "loading map, map=%s wanted %scrc=%08x", pMapName, aWanted, WantedCrc);
 	m_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, "client", aBuf);
 	SetState(IClient::STATE_LOADING);
 
 	// try the normal maps folder
 	str_format(aBuf, sizeof(aBuf), "maps/%s.map", pMapName);
-	pError = LoadMap(pMapName, aBuf, WantedCrc);
+	pError = LoadMap(pMapName, aBuf, pWantedSha256, WantedCrc);
 	if(!pError)
 		return pError;
 
 	// try the downloaded maps
-	str_format(aBuf, sizeof(aBuf), "downloadedmaps/%s_%08x.map", pMapName, WantedCrc);
-	pError = LoadMap(pMapName, aBuf, WantedCrc);
+	FormatMapDownloadFilename(pMapName, pWantedSha256, WantedCrc, aBuf, sizeof(aBuf));
+	pError = LoadMap(pMapName, aBuf, pWantedSha256, WantedCrc);
 	if(!pError)
 		return pError;
+
+	// backward compatibility with old names
+	if(pWantedSha256)
+	{
+		FormatMapDownloadFilename(pMapName, 0, WantedCrc, aBuf, sizeof(aBuf));
+		pError = LoadMap(pMapName, aBuf, 0, WantedCrc);
+		if(!pError)
+			return pError;
+	}
 
 	// search for the map within subfolders
 	char aFilename[128];
 	str_format(aFilename, sizeof(aFilename), "%s.map", pMapName);
 	if(Storage()->FindFile(aFilename, "maps", IStorage::TYPE_ALL, aBuf, sizeof(aBuf)))
-		pError = LoadMap(pMapName, aBuf, WantedCrc);
+		pError = LoadMap(pMapName, aBuf, pWantedSha256, WantedCrc);
 
 	return pError;
-}
-
-int CClient::PlayerScoreComp(const void *a, const void *b)
-{
-	CServerInfo::CClient *p0 = (CServerInfo::CClient *)a;
-	CServerInfo::CClient *p1 = (CServerInfo::CClient *)b;
-	if(p0->m_Player && !p1->m_Player)
-		return -1;
-	if(!p0->m_Player && p1->m_Player)
-		return 1;
-	if(p0->m_Score == p1->m_Score)
-		return 0;
-	if(p0->m_Score < p1->m_Score)
-		return 1;
-	return -1;
 }
 
 int CClient::UnpackServerInfo(CUnpacker *pUnpacker, CServerInfo *pInfo, int *pToken)
@@ -861,24 +905,46 @@ int CClient::UnpackServerInfo(CUnpacker *pUnpacker, CServerInfo *pInfo, int *pTo
 	pInfo->m_MaxPlayers = pUnpacker->GetInt();
 	pInfo->m_NumClients = pUnpacker->GetInt();
 	pInfo->m_MaxClients = pUnpacker->GetInt();
+	pInfo->m_NumBotPlayers = 0;
+	pInfo->m_NumBotSpectators = 0;
 
 	// don't add invalid info to the server browser list
-	if(pInfo->m_NumClients < 0 || pInfo->m_NumClients > MAX_CLIENTS || pInfo->m_MaxClients < 0 || pInfo->m_MaxClients > MAX_CLIENTS ||
+	if(pInfo->m_NumClients < 0 || pInfo->m_NumClients > pInfo->m_MaxClients || pInfo->m_MaxClients < 0 || pInfo->m_MaxClients > MAX_CLIENTS ||
 		pInfo->m_NumPlayers < 0 || pInfo->m_NumPlayers > pInfo->m_NumClients || pInfo->m_MaxPlayers < 0 || pInfo->m_MaxPlayers > pInfo->m_MaxClients)
+		return -1;
+	// drop standard gametype with more than MAX_PLAYERS
+	if(pInfo->m_MaxPlayers > MAX_PLAYERS && (str_comp(pInfo->m_aGameType, "DM") == 0 || str_comp(pInfo->m_aGameType, "TDM") == 0 || str_comp(pInfo->m_aGameType, "CTF") == 0 ||
+		str_comp(pInfo->m_aGameType, "LTS") == 0 || str_comp(pInfo->m_aGameType, "LMS") == 0))
 		return -1;
 
 	// use short version
 	if(!pToken)
 		return 0;
 
+	int NumPlayers = 0;
+	int NumClients = 0;
 	for(int i = 0; i < pInfo->m_NumClients; i++)
 	{
 		str_copy(pInfo->m_aClients[i].m_aName, pUnpacker->GetString(CUnpacker::SANITIZE_CC|CUnpacker::SKIP_START_WHITESPACES), sizeof(pInfo->m_aClients[i].m_aName));
 		str_copy(pInfo->m_aClients[i].m_aClan, pUnpacker->GetString(CUnpacker::SANITIZE_CC|CUnpacker::SKIP_START_WHITESPACES), sizeof(pInfo->m_aClients[i].m_aClan));
 		pInfo->m_aClients[i].m_Country = pUnpacker->GetInt();
 		pInfo->m_aClients[i].m_Score = pUnpacker->GetInt();
-		pInfo->m_aClients[i].m_Player = pUnpacker->GetInt() != 0 ? true : false;
+		pInfo->m_aClients[i].m_PlayerType = pUnpacker->GetInt()&CServerInfo::CClient::PLAYERFLAG_MASK;
+
+		if(pInfo->m_aClients[i].m_PlayerType&CServerInfo::CClient::PLAYERFLAG_BOT)
+		{
+			if(pInfo->m_aClients[i].m_PlayerType&CServerInfo::CClient::PLAYERFLAG_SPEC)
+				pInfo->m_NumBotSpectators++;
+			else
+				pInfo->m_NumBotPlayers++;
+		}
+
+		NumClients++;
+		if(!(pInfo->m_aClients[i].m_PlayerType&CServerInfo::CClient::PLAYERFLAG_SPEC))
+			NumPlayers++;
 	}
+	pInfo->m_NumPlayers = NumPlayers;
+	pInfo->m_NumClients = NumClients;
 
 	return 0;
 }
@@ -993,7 +1059,7 @@ void CClient::ProcessConnlessPacket(CNetChunk *pPacket)
 		int Token;
 		if(!UnpackServerInfo(&Up, &Info, &Token) && !Up.Error())
 		{
-			qsort(Info.m_aClients, Info.m_NumClients, sizeof(*Info.m_aClients), PlayerScoreComp);
+			std::stable_sort(Info.m_aClients, Info.m_aClients + Info.m_NumClients);
 			m_ServerBrowser.Set(pPacket->m_Address, CServerBrowser::SET_TOKEN, Token, &Info);
 		}
 	}
@@ -1022,13 +1088,13 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 			int MapSize = Unpacker.GetInt();
 			int MapChunkNum = Unpacker.GetInt();
 			int MapChunkSize = Unpacker.GetInt();
-			const char *pError = 0;
-
 			if(Unpacker.Error())
 				return;
+			const SHA256_DIGEST *pMapSha256 = (const SHA256_DIGEST *)Unpacker.GetRaw(sizeof(*pMapSha256));
+			const char *pError = 0;
 
 			// check for valid standard map
-			if(!m_MapChecker.IsMapValid(pMap, MapCrc, MapSize))
+			if(!m_MapChecker.IsMapValid(pMap, pMapSha256, MapCrc, MapSize))
 				pError = "invalid standard map";
 
 			// protect the player from nasty map names
@@ -1045,7 +1111,7 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 				DisconnectWithReason(pError);
 			else
 			{
-				pError = LoadMapSearch(pMap, MapCrc);
+				pError = LoadMapSearch(pMap, pMapSha256, MapCrc);
 
 				if(!pError)
 				{
@@ -1055,7 +1121,7 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 				else
 				{
 					// start map download
-					str_format(m_aMapdownloadFilename, sizeof(m_aMapdownloadFilename), "downloadedmaps/%s_%08x.map", pMap, MapCrc);
+					FormatMapDownloadFilename(pMap, pMapSha256, MapCrc, m_aMapdownloadFilename, sizeof(m_aMapdownloadFilename));
 
 					char aBuf[256];
 					str_format(aBuf, sizeof(aBuf), "starting to download map to '%s'", m_aMapdownloadFilename);
@@ -1068,6 +1134,8 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 					m_MapdownloadChunk = 0;
 					m_MapdownloadChunkNum = MapChunkNum;
 					m_MapDownloadChunkSize = MapChunkSize;
+					m_MapdownloadSha256 = pMapSha256 ? *pMapSha256 : SHA256_ZEROED;
+					m_MapdownloadSha256Present = pMapSha256;
 					m_MapdownloadCrc = MapCrc;
 					m_MapdownloadTotalsize = MapSize;
 					m_MapdownloadAmount = 0;
@@ -1090,7 +1158,7 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 			const unsigned char *pData = Unpacker.GetRaw(Size);
 			if(Unpacker.Error())
 				return;
- 
+
 			io_write(m_MapdownloadFile, pData, Size);
 			++m_MapdownloadChunk;
 			m_MapdownloadAmount += Size;
@@ -1107,7 +1175,7 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 				m_MapdownloadTotalsize = -1;
 
 				// load map
-				const char *pError = LoadMap(m_aMapdownloadName, m_aMapdownloadFilename, m_MapdownloadCrc);
+				const char *pError = LoadMap(m_aMapdownloadName, m_aMapdownloadFilename, m_MapdownloadSha256Present ? &m_MapdownloadSha256 : 0, m_MapdownloadCrc);
 				if(!pError)
 				{
 					m_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, "client/network", "loading done");
@@ -1132,7 +1200,7 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 			net_addr_str(&pPacket->m_Address, Info.m_aAddress, sizeof(Info.m_aAddress), true);
 			if(!UnpackServerInfo(&Unpacker, &Info, 0) && !Unpacker.Error())
 			{
-				qsort(Info.m_aClients, Info.m_NumClients, sizeof(*Info.m_aClients), PlayerScoreComp);
+				std::stable_sort(Info.m_aClients, Info.m_aClients + Info.m_NumClients);
 				mem_copy(&m_CurrentServerInfo, &Info, sizeof(m_CurrentServerInfo));
 				m_CurrentServerInfo.m_NetAddr = m_ServerAddress;
 			}
@@ -1160,6 +1228,18 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 			if(Unpacker.Error() == 0)
 				m_pConsole->DeregisterTemp(pName);
 		}
+		else if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_MAPLIST_ENTRY_ADD)
+		{
+			const char *pName = Unpacker.GetString(CUnpacker::SANITIZE_CC);
+			if(Unpacker.Error() == 0)
+				m_pConsole->RegisterTempMap(pName);
+		}
+		else if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_MAPLIST_ENTRY_REM)
+		{
+			const char *pName = Unpacker.GetString(CUnpacker::SANITIZE_CC);
+			if(Unpacker.Error() == 0)
+				m_pConsole->DeregisterTempMap(pName);
+		}
 		else if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_RCON_AUTH_ON)
 		{
 			m_RconAuthed = 1;
@@ -1171,6 +1251,7 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 			if(m_UseTempRconCommands)
 				m_pConsole->DeregisterTempAll();
 			m_UseTempRconCommands = 0;
+			m_pConsole->DeregisterTempMapAll();
 		}
 		else if((pPacket->m_Flags&NET_CHUNKFLAG_VITAL) != 0 && Msg == NETMSG_RCON_LINE)
 		{
@@ -1377,7 +1458,6 @@ void CClient::ProcessServerPacket(CNetChunk *pPacket)
 						m_GameTime.Init((GameTick-1)*time_freq()/50);
 						m_aSnapshots[SNAP_PREV] = m_SnapshotStorage.m_pFirst;
 						m_aSnapshots[SNAP_CURRENT] = m_SnapshotStorage.m_pLast;
-						m_LocalStartTime = time_get();
 						SetState(IClient::STATE_ONLINE);
 						DemoRecorder_HandleAutoStart();
 					}
@@ -1667,20 +1747,25 @@ void CClient::VersionUpdate()
 	{
 		if(m_VersionInfo.m_VersionServeraddr.m_Job.Status() == CJob::STATE_DONE)
 		{
-			CNetChunk Packet;
+			if(m_VersionInfo.m_VersionServeraddr.m_Job.Result() == 0)
+			{
+				CNetChunk Packet;
 
-			mem_zero(&Packet, sizeof(Packet));
+				mem_zero(&Packet, sizeof(Packet));
 
-			m_VersionInfo.m_VersionServeraddr.m_Addr.port = VERSIONSRV_PORT;
+				m_VersionInfo.m_VersionServeraddr.m_Addr.port = VERSIONSRV_PORT;
 
-			Packet.m_ClientID = -1;
-			Packet.m_Address = m_VersionInfo.m_VersionServeraddr.m_Addr;
-			Packet.m_pData = VERSIONSRV_GETVERSION;
-			Packet.m_DataSize = sizeof(VERSIONSRV_GETVERSION);
-			Packet.m_Flags = NETSENDFLAG_CONNLESS;
+				Packet.m_ClientID = -1;
+				Packet.m_Address = m_VersionInfo.m_VersionServeraddr.m_Addr;
+				Packet.m_pData = VERSIONSRV_GETVERSION;
+				Packet.m_DataSize = sizeof(VERSIONSRV_GETVERSION);
+				Packet.m_Flags = NETSENDFLAG_CONNLESS;
 
-			m_ContactClient.Send(&Packet);
-			m_VersionInfo.m_State = CVersionInfo::STATE_READY;
+				m_ContactClient.Send(&Packet);
+				m_VersionInfo.m_State = CVersionInfo::STATE_READY;
+			}
+			else
+				m_VersionInfo.m_State = CVersionInfo::STATE_ERROR;
 		}
 	}
 }
@@ -1709,6 +1794,86 @@ void CClient::InitInterfaces()
 	//
 	m_ServerBrowser.Init(&m_ContactClient, m_pGameClient->NetVersion());
 	m_Friends.Init();
+}
+
+bool CClient::LimitFps()
+{
+	if(g_Config.m_GfxVsync || !g_Config.m_GfxLimitFps) return false;
+
+	/**
+		If desired frame time is not reached:
+			Skip rendering the frame
+			Do another game loop
+
+		If we don't have the time to do another game loop:
+			Wait until desired frametime
+
+		Returns true if frame should be skipped
+	**/
+
+#ifdef CONF_DEBUG
+	static double DbgTimeWaited = 0.0;
+	static int64 DbgFramesSkippedCount = 0;
+	static int64 DbgLastSkippedDbgMsg = time_get();
+#endif
+
+	int64 Now = time_get();
+	const double LastCpuFrameTime = (Now - m_LastCpuTime) / (double)time_freq();
+	m_LastAvgCpuFrameTime = (m_LastAvgCpuFrameTime + LastCpuFrameTime * 4.0) / 5.0;
+	m_LastCpuTime = Now;
+
+	bool SkipFrame = true;
+	double RenderDeltaTime = (Now - m_LastRenderTime) / (double)time_freq();
+	const double DesiredTime = 1.0/g_Config.m_GfxMaxFps;
+
+	// we can't skip another frame, so wait instead
+	if(SkipFrame && RenderDeltaTime < DesiredTime &&
+	   m_LastAvgCpuFrameTime * 1.20 > (DesiredTime - RenderDeltaTime))
+	{
+#ifdef CONF_DEBUG
+		DbgTimeWaited += DesiredTime - RenderDeltaTime;
+#endif
+		const double Freq = (double)time_freq();
+		const int64 LastT = m_LastRenderTime;
+		double d = DesiredTime - RenderDeltaTime;
+		while(d > 0.00001)
+		{
+			Now = time_get();
+			RenderDeltaTime = (Now - LastT) / Freq;
+			d = DesiredTime - RenderDeltaTime;
+			cpu_relax();
+		}
+
+		SkipFrame = false;
+		m_LastCpuTime = Now;
+	}
+
+	// RenderDeltaTime exceeds DesiredTime, render
+	if(SkipFrame && RenderDeltaTime > DesiredTime)
+	{
+		SkipFrame = false;
+	}
+
+#ifdef CONF_DEBUG
+	DbgFramesSkippedCount += SkipFrame? 1:0;
+
+	Now = time_get();
+	if(g_Config.m_GfxLimitFps &&
+	   g_Config.m_Debug &&
+	   (Now - DbgLastSkippedDbgMsg) / (double)time_freq() > 5.0)
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "LimitFps: FramesSkippedCount=%lu TimeWaited=%.3f (per sec)",
+				   (unsigned long)(DbgFramesSkippedCount/5),
+				   DbgTimeWaited/5.0);
+		m_pConsole->Print(IConsole::OUTPUT_LEVEL_DEBUG, "client", aBuf);
+		DbgFramesSkippedCount = 0;
+		DbgTimeWaited = 0;
+		DbgLastSkippedDbgMsg = Now;
+	}
+#endif
+
+	return SkipFrame;
 }
 
 void CClient::Run()
@@ -1796,13 +1961,10 @@ void CClient::Run()
 	char aBuf[256];
 	str_format(aBuf, sizeof(aBuf), "version %s", GameClient()->NetVersion());
 	m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "client", aBuf);
-
-	// connect to the server if wanted
-	/*
-	if(config.cl_connect[0] != 0)
-		Connect(config.cl_connect);
-	config.cl_connect[0] = 0;
-	*/
+	if(str_comp(GameClient()->NetVersionHashUsed(), GameClient()->NetVersionHashReal()))
+	{
+		m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "client", "WARNING: netversion hash differs");
+	}
 
 	//
 	m_FpsGraph.Init(0.0f, 120.0f);
@@ -1868,19 +2030,21 @@ void CClient::Run()
 		}
 
 		// panic quit button
-		if(Input()->KeyIsPressed(KEY_LCTRL) && Input()->KeyIsPressed(KEY_LSHIFT) && Input()->KeyPress(KEY_Q, true))
+		bool IsCtrlPressed = Input()->KeyIsPressed(KEY_LCTRL);
+		bool IsLShiftPressed = Input()->KeyIsPressed(KEY_LSHIFT);
+		if(IsCtrlPressed && IsLShiftPressed && Input()->KeyPress(KEY_Q, true))
 		{
 			Quit();
 			break;
 		}
 
-		if(Input()->KeyIsPressed(KEY_LCTRL) && Input()->KeyIsPressed(KEY_LSHIFT) && Input()->KeyPress(KEY_D, true))
+		if(IsCtrlPressed && IsLShiftPressed && Input()->KeyPress(KEY_D, true))
 			g_Config.m_Debug ^= 1;
 
-		if(Input()->KeyIsPressed(KEY_LCTRL) && Input()->KeyIsPressed(KEY_LSHIFT) && Input()->KeyPress(KEY_G, true))
+		if(IsCtrlPressed && IsLShiftPressed && Input()->KeyPress(KEY_G, true))
 			g_Config.m_DbgGraphs ^= 1;
 
-		if(Input()->KeyIsPressed(KEY_LCTRL) && Input()->KeyIsPressed(KEY_LSHIFT) && Input()->KeyPress(KEY_E, true))
+		if(IsCtrlPressed && IsLShiftPressed && Input()->KeyPress(KEY_E, true))
 		{
 			g_Config.m_ClEditor = g_Config.m_ClEditor^1;
 			Input()->MouseModeRelative();
@@ -1893,6 +2057,7 @@ void CClient::Run()
 				if(!m_EditorActive)
 				{
 					GameClient()->OnActivateEditor();
+					Input()->MouseModeRelative();
 					m_EditorActive = true;
 				}
 			}
@@ -1900,14 +2065,17 @@ void CClient::Run()
 				m_EditorActive = false;
 
 			Update();
-			
-			if(!g_Config.m_GfxAsyncRender || m_pGraphics->IsIdle())
+
+			const bool SkipFrame = LimitFps();
+
+			if(!SkipFrame && (!g_Config.m_GfxAsyncRender || m_pGraphics->IsIdle()))
 			{
 				m_RenderFrames++;
 
 				// update frametime
 				int64 Now = time_get();
 				m_RenderFrameTime = (Now - m_LastRenderTime) / (float)time_freq();
+
 				if(m_RenderFrameTime < m_RenderFrameTimeLow)
 					m_RenderFrameTimeLow = m_RenderFrameTime;
 				if(m_RenderFrameTime > m_RenderFrameTimeHigh)
@@ -1984,6 +2152,8 @@ void CClient::Run()
 	m_pGraphics->Shutdown();
 	m_pSound->Shutdown();
 
+	m_ServerBrowser.SaveServerlist();
+
 	// shutdown SDL
 	{
 		SDL_Quit();
@@ -2037,6 +2207,15 @@ void CClient::AutoScreenshot_Start()
 	}
 }
 
+void CClient::AutoStatScreenshot_Start()
+{
+	if(g_Config.m_ClAutoStatScreenshot)
+	{
+		Graphics()->TakeScreenshot("auto/stat");
+		m_AutoStatScreenshotRecycle = true;
+	}
+}
+
 void CClient::AutoScreenshot_Cleanup()
 {
 	if(m_AutoScreenshotRecycle)
@@ -2048,6 +2227,16 @@ void CClient::AutoScreenshot_Cleanup()
 			AutoScreens.Init(Storage(), "screenshots/auto", "autoscreen", ".png", g_Config.m_ClAutoScreenshotMax);
 		}
 		m_AutoScreenshotRecycle = false;
+	}
+	if(m_AutoStatScreenshotRecycle)
+	{
+		if(g_Config.m_ClAutoScreenshotMax)
+		{
+			// clean up auto taken stat screens
+			CFileCollection AutoScreens;
+			AutoScreens.Init(Storage(), "screenshots/auto", "stat", ".png", g_Config.m_ClAutoScreenshotMax);
+		}
+		m_AutoStatScreenshotRecycle = false;
 	}
 }
 
@@ -2072,7 +2261,7 @@ void CClient::Con_RconAuth(IConsole::IResult *pResult, void *pUserData)
 const char *CClient::DemoPlayer_Play(const char *pFilename, int StorageType)
 {
 	int Crc;
-	
+
 	Disconnect();
 	m_NetClient.ResetErrorString();
 
@@ -2088,7 +2277,7 @@ const char *CClient::DemoPlayer_Play(const char *pFilename, int StorageType)
 		(m_DemoPlayer.Info()->m_Header.m_aMapCrc[1]<<16)|
 		(m_DemoPlayer.Info()->m_Header.m_aMapCrc[2]<<8)|
 		(m_DemoPlayer.Info()->m_Header.m_aMapCrc[3]);
-	pError = LoadMapSearch(m_DemoPlayer.Info()->m_Header.m_aMapName, Crc);
+	pError = LoadMapSearch(m_DemoPlayer.Info()->m_Header.m_aMapName, 0, Crc);
 	if(pError)
 	{
 		DisconnectWithReason(pError);
@@ -2143,7 +2332,7 @@ void CClient::DemoRecorder_Start(const char *pFilename, bool WithTimestamp)
 		}
 		else
 			str_format(aFilename, sizeof(aFilename), "demos/%s.demo", pFilename);
-		m_DemoRecorder.Start(Storage(), m_pConsole, aFilename, GameClient()->NetVersion(), m_aCurrentMap, m_CurrentMapCrc, "client");
+		m_DemoRecorder.Start(Storage(), m_pConsole, aFilename, GameClient()->NetVersion(), m_aCurrentMap, m_CurrentMapSha256, m_CurrentMapCrc, "client");
 	}
 }
 
@@ -2308,8 +2497,6 @@ void CClient::RegisterCommands()
 
 	// used for server browser update
 	m_pConsole->Chain("br_filter_string", ConchainServerBrowserUpdate, this);
-	m_pConsole->Chain("br_filter_gametype", ConchainServerBrowserUpdate, this);
-	m_pConsole->Chain("br_filter_serveraddress", ConchainServerBrowserUpdate, this);
 
 	m_pConsole->Chain("gfx_screen", ConchainWindowScreen, this);
 	m_pConsole->Chain("gfx_fullscreen", ConchainFullscreen, this);
@@ -2324,9 +2511,9 @@ static CClient *CreateClient()
 	return new(pClient) CClient;
 }
 
-void CClient::HandleTeeworldsConnectLink(const char *pConLink)
+void CClient::ConnectOnStart(const char *pAddress)
 {
-	str_copy(m_aCmdConnect, pConLink, sizeof(m_aCmdConnect));
+	str_copy(m_aCmdConnect, pAddress, sizeof(m_aCmdConnect));
 }
 
 /*
@@ -2340,16 +2527,21 @@ void CClient::HandleTeeworldsConnectLink(const char *pConLink)
 	Prediction Latency
 		Upstream latency
 */
-
+#if defined(CONF_PLATFORM_MACOSX)
+extern "C" int SDL_main(int argc, char **argv_) // ignore_convention
+{
+	const char **argv = const_cast<const char **>(argv_);
+#else
 int main(int argc, const char **argv) // ignore_convention
 {
+#endif
 #if defined(CONF_FAMILY_WINDOWS)
+	bool QuickEditMode = false;
 	for(int i = 1; i < argc; i++) // ignore_convention
 	{
-		if(str_comp("-s", argv[i]) == 0 || str_comp("--silent", argv[i]) == 0) // ignore_convention
+		if(str_comp("--quickeditmode", argv[i]) == 0) // ignore_convention
 		{
-			FreeConsole();
-			break;
+			QuickEditMode = true;
 		}
 	}
 #endif
@@ -2362,6 +2554,12 @@ int main(int argc, const char **argv) // ignore_convention
 			UseDefaultConfig = true;
 			break;
 		}
+	}
+
+	if(secure_random_init() != 0)
+	{
+		dbg_msg("secure", "could not initialize secure RNG");
+		return -1;
 	}
 
 	CClient *pClient = CreateClient();
@@ -2435,24 +2633,35 @@ int main(int argc, const char **argv) // ignore_convention
 		// parse the command line arguments
 		if(argc > 1) // ignore_convention
 		{
-			switch(argc) // ignore_convention
+			const char *pAddress = 0;
+			if(argc == 2)
 			{
-			case 2:
+				pAddress = str_startswith(argv[1], "teeworlds:");
+			}
+			if(pAddress)
 			{
-				// handle Teeworlds connect link
-				const int Length = str_length(pClient->m_pConLinkIdentifier);
-				if(str_comp_num(pClient->m_pConLinkIdentifier, argv[1], Length) == 0) // ignore_convention
-				{
-					pClient->HandleTeeworldsConnectLink(argv[1] + Length); // ignore_convention
-					break;
-				}
+				pClient->ConnectOnStart(pAddress);
 			}
-			default:
-				pConsole->ParseArguments(argc - 1, &argv[1]); // ignore_convention
+			else
+			{
+				pConsole->ParseArguments(argc - 1, &argv[1]);
 			}
-
 		}
 	}
+#if defined(CONF_FAMILY_WINDOWS)
+	bool HideConsole = false;
+	#ifdef CONF_RELEASE
+	if(!(g_Config.m_ShowConsoleWindow&2))
+	#else
+	if(!(g_Config.m_ShowConsoleWindow&1))
+	#endif
+	{
+		HideConsole = true;
+		FreeConsole();
+	}
+	else if(!QuickEditMode)
+		dbg_console_init();
+#endif
 
 	// restore empty config strings to their defaults
 	pConfig->RestoreStrings();
@@ -2466,6 +2675,10 @@ int main(int argc, const char **argv) // ignore_convention
 	// write down the config and quit
 	pConfig->Save();
 
+#if defined(CONF_FAMILY_WINDOWS)
+	if(!HideConsole && !QuickEditMode)
+		dbg_console_cleanup();
+#endif
 	// free components
 	mem_free(pClient);
 	delete pKernel;

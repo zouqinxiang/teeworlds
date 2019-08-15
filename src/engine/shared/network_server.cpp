@@ -120,10 +120,15 @@ int CNetServer::Recv(CNetChunk *pChunk, TOKEN *pResponseToken)
 		{
 			// check for bans
 			char aBuf[128];
-			if(NetBan() && NetBan()->IsBanned(&Addr, aBuf, sizeof(aBuf)))
+			int LastInfoQuery;
+			if(NetBan() && NetBan()->IsBanned(&Addr, aBuf, sizeof(aBuf), &LastInfoQuery))
 			{
-				// banned, reply with a message
-				CNetBase::SendControlMsg(m_Socket, &Addr, m_RecvUnpacker.m_Data.m_ResponseToken, 0, NET_CTRLMSG_CLOSE, aBuf, str_length(aBuf)+1);
+				// banned, reply with a message (5 second cooldown)
+				int Time = time_timestamp();
+				if(LastInfoQuery + 5 < Time)
+				{
+					CNetBase::SendControlMsg(m_Socket, &Addr, m_RecvUnpacker.m_Data.m_ResponseToken, 0, NET_CTRLMSG_CLOSE, aBuf, str_length(aBuf) + 1);
+				}
 				continue;
 			}
 
@@ -159,12 +164,12 @@ int CNetServer::Recv(CNetChunk *pChunk, TOKEN *pResponseToken)
 			if(Found)
 				continue;
 
-			int Accept = m_TokenManager.ProcessMessage(&Addr, &m_RecvUnpacker.m_Data, true);
+			int Accept = m_TokenManager.ProcessMessage(&Addr, &m_RecvUnpacker.m_Data);
+			if(Accept <= 0)
+				continue;
 
 			if(m_RecvUnpacker.m_Data.m_Flags&NET_PACKETFLAG_CONTROL)
 			{
-				if(!Accept)
-					continue;
 				if(m_RecvUnpacker.m_Data.m_aChunkData[0] == NET_CTRLMSG_CONNECT)
 				{
 					bool Found = false;
@@ -199,7 +204,6 @@ int CNetServer::Recv(CNetChunk *pChunk, TOKEN *pResponseToken)
 							Found = true;
 							m_aSlots[i].m_Connection.SetToken(m_RecvUnpacker.m_Data.m_Token);
 							m_aSlots[i].m_Connection.Feed(&m_RecvUnpacker.m_Data, &Addr);
-							m_aSlots[i].m_Connection.SetToken(m_RecvUnpacker.m_Data.m_Token); // HACK!
 							if(m_pfnNewClient)
 								m_pfnNewClient(i, m_UserPtr);
 							break;
@@ -213,17 +217,11 @@ int CNetServer::Recv(CNetChunk *pChunk, TOKEN *pResponseToken)
 					}
 				}
 				else if(m_RecvUnpacker.m_Data.m_aChunkData[0] == NET_CTRLMSG_TOKEN)
-					m_TokenCache.AddToken(&Addr, m_RecvUnpacker.m_Data.m_ResponseToken);
+					m_TokenCache.AddToken(&Addr, m_RecvUnpacker.m_Data.m_ResponseToken, NET_TOKENFLAG_RESPONSEONLY);
 			}
 			else if(m_RecvUnpacker.m_Data.m_Flags&NET_PACKETFLAG_CONNLESS)
 			{
 				pChunk->m_Flags = NETSENDFLAG_CONNLESS;
-				if(Accept < 0)
-				{
-					if(!(m_Flags&NETCREATE_FLAG_ALLOWSTATELESS))
-						continue;
-					pChunk->m_Flags |= NETSENDFLAG_STATELESS;
-				}
 				pChunk->m_ClientID = -1;
 				pChunk->m_Address = Addr;
 				pChunk->m_DataSize = m_RecvUnpacker.m_Data.m_DataSize;
@@ -252,18 +250,12 @@ int CNetServer::Send(CNetChunk *pChunk, TOKEN Token)
 				if(net_addr_comp(&pChunk->m_Address, m_aSlots[i].m_Connection.PeerAddress()) == 0)
 				{
 					// upgrade the packet, now that we know its recipent
-					pChunk->m_Flags &= ~NETSENDFLAG_STATELESS;
 					pChunk->m_ClientID = i;
 					break;
 				}
 
-		if(pChunk->m_Flags&NETSENDFLAG_STATELESS || Token != NET_TOKEN_NONE)
+		if(Token != NET_TOKEN_NONE)
 		{
-			if(pChunk->m_Flags&NETSENDFLAG_STATELESS)
-			{
-				dbg_assert(pChunk->m_ClientID == -1, "errornous client id, connless packets can only be sent to cid=-1");
-				dbg_assert(Token == NET_TOKEN_NONE, "stateless packets can't have a token");
-			}
 			CNetBase::SendPacketConnless(m_Socket, &pChunk->m_Address, Token, m_TokenManager.GenerateToken(&pChunk->m_Address), pChunk->m_pData, pChunk->m_DataSize);
 		}
 		else

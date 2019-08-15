@@ -5,6 +5,7 @@
 
 #include <engine/graphics.h>
 #include <base/vmath.h>
+#include <generated/protocol.h>
 #include <game/mapitems.h>
 #include "ui.h"
 
@@ -12,14 +13,6 @@
 // sprite renderings
 enum
 {
-	SKINPART_BODY = 0,
-	SKINPART_MARKING,
-	SKINPART_DECORATION,
-	SKINPART_HANDS,
-	SKINPART_FEET,
-	SKINPART_EYES,
-	NUM_SKINPARTS,
-
 	SPRITE_FLAG_FLIP_Y = 1,
 	SPRITE_FLAG_FLIP_X = 2,
 
@@ -41,12 +34,17 @@ public:
 	};
 
 	IGraphics::CTextureHandle m_aTextures[NUM_SKINPARTS];
+	IGraphics::CTextureHandle m_HatTexture;
+	IGraphics::CTextureHandle m_BotTexture;
+	int m_HatSpriteIndex;
+	vec4 m_BotColor;
 	vec4 m_aColors[NUM_SKINPARTS];
 	float m_Size;
 	int m_GotAirJump;
 };
 
 typedef void (*ENVELOPE_EVAL)(float TimeOffset, int Env, float *pChannels, void *pUser);
+class CTextCursor;
 
 class CRenderTools
 {
@@ -76,6 +74,8 @@ public:
 
 	// object render methods (gc_render_obj.cpp)
 	void RenderTee(class CAnimState *pAnim, CTeeRenderInfo *pInfo, int Emote, vec2 Dir, vec2 Pos);
+	void RenderTeeHand(CTeeRenderInfo *pInfo, vec2 CenterPos, vec2 Dir, float AngleOffset,
+					   vec2 PostRotOffset);
 
 	// map render methods (gc_render_map.cpp)
 	static void RenderEvalEnvelope(CEnvPoint *pPoints, int NumPoints, int Channels, float Time, float *pResult);
@@ -87,6 +87,9 @@ public:
 		float OffsetX, float OffsetY, float Aspect, float Zoom, float aPoints[4]);
 	void MapScreenToGroup(float CenterX, float CenterY, CMapItemGroup *pGroup, float Zoom);
 
+	void DrawClientID(ITextRender* pTextRender, CTextCursor* pCursor, int ID,
+					  const vec4& BgColor = vec4(1, 1, 1, 0.5f), const vec4& TextColor = vec4(0.1f, 0.1f, 0.1f, 1.0f));
+	float GetClientIdRectSize(float FontSize);
 };
 
 #endif

@@ -81,7 +81,6 @@ void BuildPackets()
 	int ServersLeft = m_NumServers;
 	m_NumPackets = 0;
 	int PacketIndex = 0;
-	int PacketIndexLegacy = 0;
 	while(ServersLeft-- && m_NumPackets < MAX_PACKETS)
 	{
 		if(pCurrent->m_Type == SERVERTYPE_NORMAL)
@@ -323,13 +322,13 @@ int main(int argc, const char **argv) // ignore_convention
 		BindAddr.port = MASTERSERVER_PORT;
 	}
 
-	if(!m_NetOp.Open(BindAddr, NETCREATE_FLAG_ALLOWSTATELESS))
+	if(!m_NetOp.Open(BindAddr, 0))
 	{
 		dbg_msg("mastersrv", "couldn't start network (op)");
 		return -1;
 	}
 	BindAddr.port = MASTERSERVER_PORT+1;
-	if(!m_NetChecker.Open(BindAddr, NETCREATE_FLAG_ALLOWSTATELESS))
+	if(!m_NetChecker.Open(BindAddr, 0))
 	{
 		dbg_msg("mastersrv", "couldn't start network (checker)");
 		return -1;
@@ -351,7 +350,7 @@ int main(int argc, const char **argv) // ignore_convention
 		while(m_NetOp.Recv(&Packet, &Token))
 		{
 			// check if the server is banned
-			if(m_NetBan.IsBanned(&Packet.m_Address, 0, 0))
+			if(m_NetBan.IsBanned(&Packet.m_Address, 0, 0, 0))
 				continue;
 
 			if(Packet.m_DataSize == sizeof(SERVERBROWSE_HEARTBEAT)+2 &&
@@ -406,7 +405,7 @@ int main(int argc, const char **argv) // ignore_convention
 		while(m_NetChecker.Recv(&Packet, &Token))
 		{
 			// check if the server is banned
-			if(m_NetBan.IsBanned(&Packet.m_Address, 0, 0))
+			if(m_NetBan.IsBanned(&Packet.m_Address, 0, 0, 0))
 				continue;
 
 			if(Packet.m_DataSize == sizeof(SERVERBROWSE_FWRESPONSE) &&

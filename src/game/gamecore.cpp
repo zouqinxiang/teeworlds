@@ -72,6 +72,7 @@ void CCharacterCore::Reset()
 	m_HookedPlayer = -1;
 	m_Jumped = 0;
 	m_TriggeredEvents = 0;
+	m_Death = false;
 }
 
 void CCharacterCore::Tick(bool UseInput)
@@ -139,9 +140,7 @@ void CCharacterCore::Tick(bool UseInput)
 		{
 			m_HookedPlayer = -1;
 			m_HookState = HOOK_IDLE;
-			m_HookPos = vec2(0,0);
-			m_HookDir = vec2(0,0);
-			m_HookTick = 0;
+			m_HookPos = m_Pos;
 		}
 	}
 
@@ -174,7 +173,6 @@ void CCharacterCore::Tick(bool UseInput)
 	{
 		m_HookState = HOOK_RETRACTED;
 		//m_TriggeredEvents |= COREEVENTFLAG_HOOK_RETRACT;
-		m_HookState = HOOK_RETRACTED;
 	}
 	else if(m_HookState == HOOK_FLYING)
 	{
@@ -352,12 +350,13 @@ void CCharacterCore::Move()
 	if(!m_pWorld)
 		return;
 
+	float PhysSize = 28.0f;
 	float RampValue = VelocityRamp(length(m_Vel)*50, m_pWorld->m_Tuning.m_VelrampStart, m_pWorld->m_Tuning.m_VelrampRange, m_pWorld->m_Tuning.m_VelrampCurvature);
 
 	m_Vel.x = m_Vel.x*RampValue;
 
 	vec2 NewPos = m_Pos;
-	m_pCollision->MoveBox(&NewPos, &m_Vel, vec2(28.0f, 28.0f), 0);
+	m_pCollision->MoveBox(&NewPos, &m_Vel, vec2(PhysSize, PhysSize), 0, &m_Death);
 
 	m_Vel.x = m_Vel.x*(1.0f/RampValue);
 
@@ -377,7 +376,7 @@ void CCharacterCore::Move()
 				if(!pCharCore || pCharCore == this)
 					continue;
 				float D = distance(Pos, pCharCore->m_Pos);
-				if(D < 28.0f && D > 0.0f)
+				if(D < PhysSize && D > 0.0f)
 				{
 					if(a > 0.0f)
 						m_Pos = LastPos;
@@ -404,6 +403,8 @@ void CCharacterCore::Write(CNetObj_CharacterCore *pObjCore)
 	pObjCore->m_HookTick = m_HookTick;
 	pObjCore->m_HookX = round_to_int(m_HookPos.x);
 	pObjCore->m_HookY = round_to_int(m_HookPos.y);
+	pObjCore->m_HookDx = round_to_int(m_HookDir.x*256.0f);
+	pObjCore->m_HookDy = round_to_int(m_HookDir.y*256.0f);
 	pObjCore->m_HookedPlayer = m_HookedPlayer;
 	pObjCore->m_Jumped = m_Jumped;
 	pObjCore->m_Direction = m_Direction;
@@ -420,7 +421,8 @@ void CCharacterCore::Read(const CNetObj_CharacterCore *pObjCore)
 	m_HookTick = pObjCore->m_HookTick;
 	m_HookPos.x = pObjCore->m_HookX;
 	m_HookPos.y = pObjCore->m_HookY;
-	m_HookDir = normalize(m_HookPos-m_Pos);
+	m_HookDir.x = pObjCore->m_HookDx/256.0f;
+	m_HookDir.y = pObjCore->m_HookDy/256.0f;
 	m_HookedPlayer = pObjCore->m_HookedPlayer;
 	m_Jumped = pObjCore->m_Jumped;
 	m_Direction = pObjCore->m_Direction;

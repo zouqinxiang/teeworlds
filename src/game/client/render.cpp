@@ -7,8 +7,8 @@
 #include <engine/shared/config.h>
 #include <engine/graphics.h>
 #include <engine/map.h>
+#include <engine/textrender.h>
 #include <generated/client_data.h>
-#include <generated/protocol.h>
 #include <game/layers.h>
 #include "animstate.h"
 #include "render.h"
@@ -116,14 +116,14 @@ void CRenderTools::DrawRoundRectExt(float x, float y, float w, float h, float r,
 			x+(1-Ca1)*r, y-r+Sa1*r,
 			x+(1-Ca3)*r, y-r+Sa3*r,
 			x+(1-Ca2)*r, y-r+Sa2*r);
-	
+
 		if(Corners&32) // ITR
 		ArrayF[NumItems++] = IGraphics::CFreeformItem(
 			x+w, y,
 			x+w-r+Ca1*r, y-r+Sa1*r,
 			x+w-r+Ca3*r, y-r+Sa3*r,
 			x+w-r+Ca2*r, y-r+Sa2*r);
-	
+
 		if(Corners&64) // IBL
 		ArrayF[NumItems++] = IGraphics::CFreeformItem(
 			x, y+h,
@@ -225,7 +225,7 @@ void CRenderTools::DrawRoundRectExt4(float x, float y, float w, float h, vec4 Co
 									x+(1-Ca2)*r, y-r+Sa2*r);
 			Graphics()->QuadsDrawFreeform(&ItemF, 1);
 		}
-	
+
 		if(Corners&32) // ITR
 		{
 			Graphics()->SetColor(ColorTopRight.r, ColorTopRight.g, ColorTopRight.b, ColorTopRight.a);
@@ -236,7 +236,7 @@ void CRenderTools::DrawRoundRectExt4(float x, float y, float w, float h, vec4 Co
 									x+w-r+Ca2*r, y-r+Sa2*r);
 			Graphics()->QuadsDrawFreeform(&ItemF, 1);
 		}
-	
+
 		if(Corners&64) // IBL
 		{
 			Graphics()->SetColor(ColorBottomLeft.r, ColorBottomLeft.g, ColorBottomLeft.b, ColorBottomLeft.a);
@@ -314,7 +314,7 @@ void CRenderTools::DrawUIRect(const CUIRect *r, vec4 Color, int Corners, float R
 	// TODO: FIX US
 	Graphics()->QuadsBegin();
 	Graphics()->SetColor(Color.r*Color.a, Color.g*Color.a, Color.b*Color.a, Color.a);
-	DrawRoundRectExt(r->x,r->y,r->w,r->h,Rounding*UI()->Scale(), Corners);
+	DrawRoundRectExt(r->x,r->y,r->w,r->h,Rounding, Corners);
 	Graphics()->QuadsEnd();
 }
 
@@ -323,7 +323,7 @@ void CRenderTools::DrawUIRect4(const CUIRect *r, vec4 ColorTopLeft, vec4 ColorTo
 	Graphics()->TextureClear();
 
 	Graphics()->QuadsBegin();
-	DrawRoundRectExt4(r->x,r->y,r->w,r->h,ColorTopLeft,ColorTopRight,ColorBottomLeft,ColorBottomRight,Rounding*UI()->Scale(), Corners);
+	DrawRoundRectExt4(r->x,r->y,r->w,r->h,ColorTopLeft,ColorTopRight,ColorBottomLeft,ColorBottomRight,Rounding, Corners);
 	Graphics()->QuadsEnd();
 }
 
@@ -331,6 +331,7 @@ void CRenderTools::RenderTee(CAnimState *pAnim, CTeeRenderInfo *pInfo, int Emote
 {
 	vec2 Direction = Dir;
 	vec2 Position = Pos;
+	bool IsBot = pInfo->m_BotTexture.IsValid();
 
 	// first pass we draw the outline
 	// second pass we draw the filling
@@ -346,7 +347,36 @@ void CRenderTools::RenderTee(CAnimState *pAnim, CTeeRenderInfo *pInfo, int Emote
 			{
 				vec2 BodyPos = Position + vec2(pAnim->GetBody()->m_X, pAnim->GetBody()->m_Y)*AnimScale;
 				IGraphics::CQuadItem BodyItem(BodyPos.x, BodyPos.y, BaseSize, BaseSize);
+				IGraphics::CQuadItem BotItem(BodyPos.x+(2.f/3.f)*AnimScale, BodyPos.y+(-16+2.f/3.f)*AnimScale, BaseSize, BaseSize); // x+0.66, y+0.66 to correct some rendering bug
 				IGraphics::CQuadItem Item;
+
+				// draw bot visuals (background)
+				if(IsBot && !OutLine)
+				{
+					Graphics()->TextureSet(pInfo->m_BotTexture);
+					Graphics()->QuadsBegin();
+					Graphics()->SetColor(1.0f, 1.0f, 1.0f, 1.0f);
+					SelectSprite(SPRITE_TEE_BOT_BACKGROUND, 0, 0, 0);
+					Item = BotItem;
+					Graphics()->QuadsDraw(&Item, 1);
+					Graphics()->QuadsEnd();
+				}
+
+				// draw bot visuals (foreground)
+				if(IsBot && !OutLine)
+				{
+					Graphics()->TextureSet(pInfo->m_BotTexture);
+					Graphics()->QuadsBegin();
+					Graphics()->SetColor(1.0f, 1.0f, 1.0f, 1.0f);
+					SelectSprite(SPRITE_TEE_BOT_FOREGROUND, 0, 0, 0);
+					Item = BotItem;
+					Graphics()->QuadsDraw(&Item, 1);
+					Graphics()->SetColor(pInfo->m_BotColor.r, pInfo->m_BotColor.g, pInfo->m_BotColor.b, pInfo->m_BotColor.a);
+					SelectSprite(SPRITE_TEE_BOT_GLOW, 0, 0, 0);
+					Item = BotItem;
+					Graphics()->QuadsDraw(&Item, 1);
+					Graphics()->QuadsEnd();
+				}
 
 				// draw decoration
 				if(pInfo->m_aTextures[SKINPART_DECORATION].IsValid())
@@ -413,7 +443,13 @@ void CRenderTools::RenderTee(CAnimState *pAnim, CTeeRenderInfo *pInfo, int Emote
 				Graphics()->TextureSet(pInfo->m_aTextures[SKINPART_EYES]);
 				Graphics()->QuadsBegin();
 				Graphics()->QuadsSetRotation(pAnim->GetBody()->m_Angle*pi*2);
-				Graphics()->SetColor(pInfo->m_aColors[SKINPART_EYES].r, pInfo->m_aColors[SKINPART_EYES].g, pInfo->m_aColors[SKINPART_EYES].b, pInfo->m_aColors[SKINPART_EYES].a);
+				if(IsBot)
+				{
+					Graphics()->SetColor(pInfo->m_BotColor.r, pInfo->m_BotColor.g, pInfo->m_BotColor.b, pInfo->m_BotColor.a);
+					Emote = EMOTE_SURPRISE;
+				}
+				else
+					Graphics()->SetColor(pInfo->m_aColors[SKINPART_EYES].r, pInfo->m_aColors[SKINPART_EYES].g, pInfo->m_aColors[SKINPART_EYES].b, pInfo->m_aColors[SKINPART_EYES].a);
 				if(p == 1)
 				{
 					switch (Emote)
@@ -442,6 +478,33 @@ void CRenderTools::RenderTee(CAnimState *pAnim, CTeeRenderInfo *pInfo, int Emote
 					Graphics()->QuadsDraw(&QuadItem, 1);
 				}
 				Graphics()->QuadsEnd();
+				
+				// draw xmas hat
+				if(!OutLine && pInfo->m_HatTexture.IsValid())
+				{
+					Graphics()->TextureSet(pInfo->m_HatTexture);
+					Graphics()->QuadsBegin();
+					Graphics()->QuadsSetRotation(pAnim->GetBody()->m_Angle*pi * 2);
+					Graphics()->SetColor(1.0f, 1.0f, 1.0f, 1.0f);
+					int Flag = Direction.x < 0.0f ? SPRITE_FLAG_FLIP_X : 0;
+					switch(pInfo->m_HatSpriteIndex)
+					{
+					case 0:
+						SelectSprite(SPRITE_TEE_HATS_TOP1, Flag, 0, 0);
+						break;
+					case 1:
+						SelectSprite(SPRITE_TEE_HATS_TOP2, Flag, 0, 0);
+						break;
+					case 2:
+						SelectSprite(SPRITE_TEE_HATS_SIDE1, Flag, 0, 0);
+						break;
+					case 3:
+						SelectSprite(SPRITE_TEE_HATS_SIDE2, Flag, 0, 0);
+					}
+					Item = BodyItem;
+					Graphics()->QuadsDraw(&Item, 1);
+					Graphics()->QuadsEnd();
+				}
 			}
 
 			// draw feet
@@ -474,6 +537,46 @@ void CRenderTools::RenderTee(CAnimState *pAnim, CTeeRenderInfo *pInfo, int Emote
 			Graphics()->QuadsEnd();
 		}
 	}
+}
+
+void CRenderTools::RenderTeeHand(CTeeRenderInfo *pInfo, vec2 CenterPos, vec2 Dir, float AngleOffset,
+								 vec2 PostRotOffset)
+{
+	// in-game hand size is 15 when tee size is 64
+	float BaseSize = 15.0f * (pInfo->m_Size / 64.0f);
+
+	vec2 HandPos = CenterPos + Dir;
+	float Angle = angle(Dir);
+	if(Dir.x < 0)
+		Angle -= AngleOffset;
+	else
+		Angle += AngleOffset;
+
+	vec2 DirX = Dir;
+	vec2 DirY(-Dir.y,Dir.x);
+
+	if(Dir.x < 0)
+		DirY = -DirY;
+
+	HandPos += DirX * PostRotOffset.x;
+	HandPos += DirY * PostRotOffset.y;
+
+	const vec4 Color = pInfo->m_aColors[SKINPART_HANDS];
+	IGraphics::CQuadItem QuadOutline(HandPos.x, HandPos.y, 2*BaseSize, 2*BaseSize);
+	IGraphics::CQuadItem QuadHand = QuadOutline;
+
+	Graphics()->TextureSet(pInfo->m_aTextures[SKINPART_HANDS]);
+	Graphics()->QuadsBegin();
+	Graphics()->SetColor(Color.r, Color.g, Color.b, Color.a);
+	Graphics()->QuadsSetRotation(Angle);
+
+	SelectSprite(SPRITE_TEE_HAND_OUTLINE, 0, 0, 0);
+	Graphics()->QuadsDraw(&QuadOutline, 1);
+	SelectSprite(SPRITE_TEE_HAND, 0, 0, 0);
+	Graphics()->QuadsDraw(&QuadHand, 1);
+
+	Graphics()->QuadsSetRotation(0);
+	Graphics()->QuadsEnd();
 }
 
 static void CalcScreenParams(float Amount, float WMax, float HMax, float Aspect, float *w, float *h)
@@ -552,4 +655,41 @@ void CRenderTools::RenderTilemapGenerateSkip(class CLayers *pLayers)
 			}
 		}
 	}
+}
+
+void CRenderTools::DrawClientID(ITextRender* pTextRender, CTextCursor* pCursor, int ID,
+								const vec4& BgColor, const vec4& TextColor)
+{
+	if(!g_Config.m_ClShowUserId) return;
+
+	char aBuff[4];
+	str_format(aBuff, sizeof(aBuff), "%2d ", ID);
+
+	const float LinebaseY = pTextRender->TextGetLineBaseY(pCursor);
+
+	float ScreenX0, ScreenY0, ScreenX1, ScreenY1;
+	Graphics()->GetScreen(&ScreenX0, &ScreenY0, &ScreenX1, &ScreenY1);
+	float FakeToScreenY = (Graphics()->ScreenHeight()/(ScreenY1-ScreenY0));
+	float FontSize = (int)(pCursor->m_FontSize * FakeToScreenY)/FakeToScreenY;
+
+	CUIRect Rect;
+	Rect.x = pCursor->m_X;
+	Rect.y = LinebaseY - FontSize + 0.025f * FontSize;
+	Rect.w = 1.4f * FontSize;
+	Rect.h = FontSize;
+	DrawRoundRect(&Rect, BgColor, 0.25f * FontSize);
+
+	const float PrevX = pCursor->m_X;
+	pCursor->m_X += (ID < 10 ? 0.04f: 0.0f) * FontSize;
+
+	// TODO: make a simple text one (no shadow)
+	pTextRender->TextShadowed(pCursor, aBuff, -1, vec2(0,0), vec4(0,0,0,0), TextColor);
+
+	pCursor->m_X = PrevX + Rect.w + 0.2f * FontSize;
+}
+
+float CRenderTools::GetClientIdRectSize(float FontSize)
+{
+	if(!g_Config.m_ClShowUserId) return 0;
+	return 1.4f * FontSize + 0.2f * FontSize;
 }
